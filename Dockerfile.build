@@ -1,0 +1,8 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install -y clang llvm libbpf-dev make gcc-multilib build-essential libelf-dev pkg-config
+
+CMD ["make"]
