@@ -1,32 +1,27 @@
 //go:build ignore
 #include <linux/bpf.h>
-#include <bpf/bpf_helpers.h>
 #include <linux/if_ether.h>
+#include <linux/in.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
-#include <linux/udp.h>
-#include <linux/in.h>
+#include <bpf/bpf_endian.h>
+#include <bpf/bpf_helpers.h>
 #include "common.h"
 
-// Checksum helper (simple version)
-static __always_inline __u16 csum_fold_helper(__u64 csum) {
-    int i;
-    for (i = 0; i < 4; i++) {
-        if (csum >> 16)
-            csum = (csum & 0xffff) + (csum >> 16);
-    }
-    return ~csum;
-}
-
-// Map to store backend servers
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __type(key, __u32);
     __type(value, struct server_info);
-    __uint(max_entries, 16);
+    __uint(max_entries, MAX_BACKENDS);
 } servers_map SEC(".maps");
 
-// Map for stats
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, __u32);
+    __type(value, struct vip_cfg);
+    __uint(max_entries, 1);
+} vip_map SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __type(key, __u32);
@@ -34,75 +29,109 @@ struct {
     __uint(max_entries, 1);
 } xdp_stats_map SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __type(key, __u32);
+    __type(value, __u64);
+    __uint(max_entries, MAX_BACKENDS);
+} backend_counts SEC(".maps");
+
+/* Dense list of servers_map indexes that are currently healthy.
+ * Indexing this with hash % active spreads flows across the live set.
+ * Walking servers_map itself does not: empty slots above the live ones
+ * all fall through to slot 0.
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, __u32);
+    __type(value, __u32);
+    __uint(max_entries, MAX_BACKENDS);
+} active_map SEC(".maps");
+
+static __always_inline void count_packet(void *data, void *data_end, int redirected) {
+    __u32 key = 0;
+    struct datarec *rec = bpf_map_lookup_elem(&xdp_stats_map, &key);
+    if (!rec)
+        return;
+    rec->rx_packets++;
+    rec->rx_bytes += (data_end - data);
+    if (redirected)
+        rec->redirected++;
+    else
+        rec->passed++;
+}
+
 SEC("xdp")
 int xdp_load_balancer(struct xdp_md *ctx) {
     void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
 
-    // 1. Parse Ethernet Header
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
-        return XDP_PASS; // Packet too short
-
-    // Only handle IPv4
+        return XDP_PASS;
     if (eth->h_proto != bpf_htons(ETH_P_IP))
         return XDP_PASS;
 
-    // 2. Parse IP Header
     struct iphdr *iph = (void *)(eth + 1);
     if ((void *)(iph + 1) > data_end)
         return XDP_PASS;
+    /* A variable IHL makes the TCP header offset unknown to the verifier. */
+    if (iph->ihl != 5 || iph->protocol != IPPROTO_TCP)
+        return XDP_PASS;
 
-    // Update Stats
-    __u32 stats_key = 0;
-    struct datarec *rec = bpf_map_lookup_elem(&xdp_stats_map, &stats_key);
-    if (rec) {
-        rec->rx_packets++;
-        rec->rx_bytes += (data_end - data);
+    struct tcphdr *tcp = (void *)(iph + 1);
+    if ((void *)(tcp + 1) > data_end)
+        return XDP_PASS;
+
+    __u32 cfg_key = 0;
+    struct vip_cfg *cfg = bpf_map_lookup_elem(&vip_map, &cfg_key);
+    if (!cfg || cfg->vip == 0)
+        return XDP_PASS;
+    if (iph->daddr != cfg->vip)
+        return XDP_PASS;
+    if (cfg->port != 0 && bpf_ntohs(tcp->dest) != cfg->port)
+        return XDP_PASS;
+
+    /* One TCP connection must stay on one backend. A per-packet counter
+     * splits the handshake and the other backend sends RST.
+     *
+     * tcp->source is network order. On this little-endian load the byte
+     * that changes between consecutive client ports sits in bits 8..15.
+     * Linux hands a fresh client even ports first and steps by 2, so bit 0
+     * of that byte stays 0. Fold it or every new connection lands on one
+     * backend when the live set has size 2.
+     */
+    __u32 raw_sport = tcp->source;
+    __u32 b = (raw_sport >> 8) & 0xff;
+    b ^= b >> 1;
+    __u32 start = (b * 0x9E3779B1u) ^ ((raw_sport & 0xff) << 8) ^ iph->saddr;
+
+    __u32 n = cfg->active;
+    if (n == 0 || n > MAX_BACKENDS) {
+        count_packet(data, data_end, 0);
+        return XDP_PASS;
     }
-
-    // 3. Simple Load Balancing Logic (e.g., Round Robin based on time or just static for demo)
-    // For this basic demo, we'll pick index 0 strictly.
-    // In a real scenario, you'd use a map to keep round-robin state or hash traffic.
-    __u32 server_idx = 0;
-    struct server_info *dest = bpf_map_lookup_elem(&servers_map, &server_idx);
-
-    if (!dest) {
-        // No backend server configured, just pass it
+    __u32 pick = start % n;
+    if (pick >= MAX_BACKENDS)
+        pick = 0;
+    __u32 *backend = bpf_map_lookup_elem(&active_map, &pick);
+    if (!backend || *backend >= MAX_BACKENDS) {
+        count_packet(data, data_end, 0);
+        return XDP_PASS;
+    }
+    __u32 key = *backend;
+    struct server_info *srv = bpf_map_lookup_elem(&servers_map, &key);
+    if (!srv || srv->ip == 0 || !srv->healthy || srv->ifindex == 0) {
+        count_packet(data, data_end, 0);
         return XDP_PASS;
     }
 
-    // 4. Modify Packet (NAT / MAC Rewrite)
-    
-    // In a real Direct Server Return (DSR) or generic LB, 
-    // we swap Mac addresses and change Destination IP.
-    
-    // Update Destination MAC
-    // Note: In real world you need the Gateway MAC if server is not on same L2.
-    // Assuming same L2 for simplicity here.
-    __builtin_memcpy(eth->h_dest, dest->mac, ETH_ALEN);
-    
-    // We swap Source MAC to be us (the LB) - conceptually.
-    // Actually, usually we keep source MAC of the router or previous hop.
-    // Let's just update Dest IP.
-    
-    // Update IP Checksum
-    // Simple incremental update for IP change
-    __u32 old_ip = iph->daddr;
-    __u32 new_ip = dest->ip;
-    
-    iph->daddr = new_ip;
-    
-    // Recalculate IP Checksum
-    // This is a naive way; XDP helpers for csum are limited, 
-    // usually we do incremental update or full recalc.
-    iph->check = 0;
-    // (In production code, recomputing checksum properly is critical)
-
-    // 5. TX the packet back out the same interface (Hairpin)
-    // Or XDP_REDIRECT to another interface.
-    // XDP_TX is fastest for "bounce back".
-    return XDP_TX;
+    __builtin_memcpy(eth->h_dest, srv->mac, ETH_ALEN);
+    __u64 *hits = bpf_map_lookup_elem(&backend_counts, &key);
+    if (hits)
+        *hits += 1;
+    count_packet(data, data_end, 1);
+    return bpf_redirect(srv->ifindex, 0);
 }
 
 char _license[] SEC("license") = "GPL";
